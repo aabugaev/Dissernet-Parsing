@@ -1,0 +1,170 @@
+---
+title: "Parsing Dissernet"
+author: "Anton Bugaev"
+date: "01 11 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,warning = F)
+
+rm(list=ls(all=TRUE)) 
+library(rvest)
+library(data.table)
+library(plyr)
+library(stringr)
+library(plotly)
+```
+
+##Подготовка 
+
+Диссернет предлагает доступ к своим спискам по алфавиту, поэтому прямо с сайта взяли список букв.
+
+Также создаем пустой DT, чтобы потом присоединять к нему информацию построчно.
+
+```{r}
+Rus_Letters <- c("А", "Б", "В", "Г", "Д", "Е", "Ж", "З", "И", "К", "Л", "М", "Н", "О", "П", "Р", "С", "Т", "У", "Ф", "Х", "Ц", "Ч", "Ш", "Щ", "Э", "Ю", "Я")
+
+dt <-data.table()
+```
+
+##Функция для сбора персональной информации
+
+На диссернете у каждого проверяемого есть личная карточка с его именем, датой защиты, степенью, оппонентами, университетами.
+Пример такой карточки: https://www.dissernet.org/expertise/abylgazievii2005.htm
+
+Эта функция принимает ссылку на личную карточку и собирает по такой личной карточке всю информацию. Позже она будет встроена в цикл.
+
+```{r}
+get_person_dossier <- function(person_link){
+  
+  #Ссылка-аргумент для тестов:
+  #person_link <- "https://www.dissernet.org/expertise/abylgazievii2005.htm"  
+  
+  person_html <- read_html(person_link)
+  
+  #Забираем дату защиты
+  Date <-person_html %>% html_nodes(xpath = "///div[3]/div/div[1]/div[1]/div/div[2]/p[3]") %>% 
+    html_text() %>% 
+    strsplit(":") %>% as.data.table()
+  
+  #Забираем степень
+  Grade <-person_html %>% html_nodes(xpath = "///div[3]/div/div[1]/div[1]/div/div[2]/p[2]") %>% 
+    html_text() %>% 
+    strsplit(":") %>% as.data.table()
+  
+  #Забираем инфо по университету, организации, оппонентам.
+  person_info_dt <- person_html %>% 
+    html_node("table") %>% 
+    html_table(fill = T) %>% 
+    t() %>% as.data.table()
+  
+  #Забираем имя
+  name <- person_html %>% html_nodes(xpath = "//div[3]/div/div[1]/div[1]/div/b") %>% html_text() %>% gsub(pattern = "\n",replacement =" ")
+  name_dt <- data.table("SomeCol" = c("Имя",name))
+  
+  #Танцы с бубном. Хотим получить DT с одной строкой - информацией по конкретному человеку. Такие DT будут складываться друг с другом в цикле.
+  Total_DT <- cbind(name_dt,Date,Grade, person_info_dt) %>% as.data.table()
+  colnames(Total_DT) <- Total_DT[1,] %>% unlist()
+  Total_DT <- Total_DT[-1]
+  
+  return(Total_DT)
+}
+
+
+```
+
+##Цикл
+
+Задача цикла - пройти по всем страницам сайта.
+Первый уровень цикла - буква. Мы знаем их конечный набор.
+
+Внутри каждой буквы - список. Ссылки пронумерованы по по порядку. Решаем с помощью бесконечного цикла, который прервется, когда список не будет найден (длина = 0).
+
+Код работает достаточно долго, потому здесь eval = F, а результат я сохранил в csv. Его  импортируем в следующем чанке.
+
+```{r, eval = F}
+# Засечем время
+start.time <- Sys.time()
+
+for (Letter in Rus_Letters) {
+  number <- 1
+  while (TRUE){
+    current_HTML <- paste0("https://www.dissernet.org/search_expertise/",number,"/?&params[letter1]=",Letter)
+    persons_list <- current_HTML %>% read_html() %>% html_nodes(".w_400 > b > a") %>% html_attr("href")
+    print(persons_list)
+    
+    for (person_url in persons_list) {
+      paste("Working on",person_url) %>% print()
+      #В самом опасном месте - ловим ошибку
+      tryCatch(dt <- rbind.fill(dt, get_person_dossier(person_url)), error = function(e) print("error") )
+    }
+  # Переходим к следующей букве, если больше в списке на текущую букву фамилий нет.  
+  if (length(persons_list) ==0) {break}
+    
+  #Переходим к следующему номеру в рамках буквы.  
+  number <- number +1
+  }
+}
+
+end.time <- Sys.time()
+Total.time <- end.time - start.time
+
+fwrite(dt, "All_dissernet.csv")
+```
+##Обработка и визуализация
+
+```{r}
+Total_DT <- fread("All_dissernet.csv")
+
+#Нас интересуют только первые девять колонок. Остальные - результат плохого форматирования при скачивании.
+Total_DT <- Total_DT[,1:9]
+
+Total_DT[, Year := str_extract(`Дата защиты`, "\\d{4}") %>% as.integer()]
+Total_DT[, is_candidate:= grepl(`Ученая степень`,pattern =  "кандидат ")]
+Total_DT[, is_doctor:= grepl(`Ученая степень`,pattern =  "доктор ")]
+
+#Делаем столбец, в котором будет указана только дисциплина для удобства и лаконичности + чистит мусор
+Total_DT[, Field := gsub(x =`Ученая степень`, pattern = "кандидат|доктор|наук| |\\(.*\\)|\\*" ,replacement = "") ]
+```
+
+
+##Кандидаты vs Доктора Диссернета
+
+Сравним распределения по специальностям докторов и кандидатов диссернета. 
+Экономистов и юристов со степенями на диссернете больше всего.
+
+```{r}
+candidates <- plot_ly(data = Total_DT[is_candidate==T], x = ~Field,
+             type = "histogram") %>%layout(showlegend = FALSE, title="Кандидаты")
+
+doctors <- plot_ly(data = Total_DT[is_doctor==T], x = ~Field,
+             type = "histogram") %>%layout(showlegend = FALSE, title="Доктора")
+
+subplot(candidates,doctors)
+```
+
+Посмотрим, как менялось распределения получения кандидатских и докторских диссертаций по годам и специальностям.
+
+Кандидаты:
+```{r}
+#Группируем данные для Stacked bar chart
+Total_DT_candidate.G <-Total_DT[is_candidate==T, .("count" = length(Имя)) ,by=.(Year, Field)][order(Year)]
+
+
+#Как менялось распределение кандидатов по годам:
+plot_ly(Total_DT_candidate.G, x = ~Year, y = ~count, type = 'bar', 
+                name = ~Field, color = ~Field) %>%
+      layout(yaxis = list(title = 'Count'), barmode = 'stack')
+```
+
+Доктора:
+```{r}
+Total_DT_doctor.G <-Total_DT[is_doctor==T, .("count" = length(Имя)) ,by=.(Year,Field)][order(Year)]
+
+#Как менялось распределение докторов по годам:
+plot_ly(Total_DT_doctor.G, x = ~Year, y = ~count, type = 'bar', 
+                name = ~Field , color = ~Field) %>%
+      layout(yaxis = list(title = 'Count'), barmode = 'stack')
+```
+
